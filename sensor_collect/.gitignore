@@ -1,0 +1,27 @@
+# ---- Keil / STM32 build output ----
+OBJ/
+*.o
+*.d
+*.dep
+*.axf
+*.hex
+*.bin
+*.map
+*.htm
+*.lnp
+*.sct
+*.crf
+*.lst
+*.build_log.htm
+
+# ---- Keil user-specific settings ----
+*.uvguix.*
+*.dbgconf
+
+# ---- Editor / logs ----
+.vscode/
+*.log
+
+# ---- OS junk ----
+Thumbs.db
+Desktop.ini

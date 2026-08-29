@@ -28,3 +28,6 @@ ui_*
 # OS
 Thumbs.db
 Desktop.ini
+
+# Office temporary files
+~$*
