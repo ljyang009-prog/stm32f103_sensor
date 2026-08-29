@@ -1,0 +1,30 @@
+# Keil / STM32
+OBJ/
+obj/
+*.o
+*.d
+*.axf
+*.bin
+*.hex
+*.map
+*.lnp
+*.uvgui.*
+*.uvoptx
+*.uvprojx.user
+
+# Qt / CMake / build
+build/
+cmake-build-*/
+*.pro.user
+*.autosave
+Makefile
+moc_*
+qrc_*
+ui_*
+
+# VS Code
+.vscode/
+
+# OS
+Thumbs.db
+Desktop.ini
