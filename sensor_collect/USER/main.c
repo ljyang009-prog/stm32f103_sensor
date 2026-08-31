@@ -9,18 +9,40 @@
 #include "buzzer.h"
 #include "light.h"
 #include "esp8266.h"
+#include "onenet.h"
+
+static void LED0_Update(void)
+{
+    static u8 previous_mode = 0xFF;
+    static u32 last_toggle = 0;
+    u8 mode = OneNet_GetLedMode();
+    u32 now = HAL_GetTick();
+
+    if (mode != previous_mode)
+    {
+        previous_mode = mode;
+        last_toggle = now;
+        LED0 = (mode == ONENET_LED_ON || mode == ONENET_LED_BLINK) ? 0 : 1;
+    }
+
+    if (mode == ONENET_LED_BLINK && (now - last_toggle) >= 500)
+    {
+        last_toggle = now;
+        LED0 = !LED0;
+    }
+}
 
 int main(void)
 {
     u16 adcx;
     float gas_ppm;
     u8 leak;
-    u8 temp;
-    u8 humi;
-    u8 dht11_ok;
-    u8 dht11_count;
-    u8 temp_alarm;
-    u8 humi_alarm;
+    u8 temp = 0;
+    u8 humi = 0;
+    u8 dht11_ok = 0;
+    u8 dht11_count = 0;
+    u8 temp_alarm = 0;
+    u8 humi_alarm = 0;
     u8 alarm;
     u16 light_raw;
     u8 light_brightness;
@@ -29,7 +51,6 @@ int main(void)
     char dht_humi_str[24];
     char light_str[24];
     u32 last_upload;
-    char mqtt_line[64];
 
     HAL_Init();
     Stm32_Clock_Init(RCC_PLL_MUL9);
@@ -59,10 +80,24 @@ int main(void)
     LCD_ShowString(30, 250, 200, 16, 16, "HUMI_ALM:OK");
     LCD_ShowString(30, 270, 200, 16, 16, "LIGHT:   % OFF");
 
-    /* ESP8266 (Arduino firmware) handles WiFi + MQTT by itself.
-     * STM32 only sends sensor data over USART2 (PA2). */
-    printf("ESP8266 UART init...\r\n");
-    ESP8266_Uart_Init(115200);
+    /* ESP8266 (AT firmware): STM32 drives it over USART2 (PA2/PA3).
+     * 1) AT handshake  2) join WiFi  3) MQTT connect to OneNET. */
+    printf("ESP8266 init...\r\n");
+    if (ESP8266_Init() != ESP8266_OK)
+    {
+        printf("ESP8266 AT handshake failed, check wiring/baud\r\n");
+    }
+    else if (ESP8266_ConnectWifi((u8 *)ESP8266_WIFI_SSID,
+                                 (u8 *)ESP8266_WIFI_PASSWORD) != ESP8266_OK)
+    {
+        printf("ESP8266 WiFi connect failed, check SSID/password\r\n");
+    }
+    else
+    {
+        printf("ESP8266 WiFi OK, connect OneNet...\r\n");
+        if (OneNet_Init() != ESP8266_OK)
+            printf("OneNet init failed; retry on next upload\r\n");
+    }
 
     /* Calibrate R0 after the sensor has warmed up a few seconds.
      * For accurate ppm, power on in clean (gas-free) air. */
@@ -74,6 +109,9 @@ int main(void)
 
     while (1)
     {
+        OneNet_Process();
+        LED0_Update();
+
         adcx = MQ2_Get_Raw_Value();
         gas_ppm = MQ2_GetPPM_LPG(adcx);
         leak = MQ2_Is_Gas_Leak_From_Raw(adcx);
@@ -169,12 +207,16 @@ int main(void)
         if ((HAL_GetTick() - last_upload) >= 5000)
         {
             last_upload = HAL_GetTick();
-            sprintf(mqtt_line, "%d,%d,%.1f,%d\r\n", temp, humi, gas_ppm, light_brightness);
-            ESP8266_Uart_SendStr((u8 *)mqtt_line);
-            printf("Send to ESP8266: %s", mqtt_line);
+            if (OneNet_SendData((float)temp, (float)humi,
+                                gas_ppm, (float)light_brightness) != ESP8266_OK)
+            {
+                printf("OneNet offline, reconnecting...\r\n");
+                OneNet_Init();
+            }
         }
 
-        LED0 = !LED0;
-        delay_ms(250);
+        OneNet_Process();
+        LED0_Update();
+        delay_ms(10);
     }
 }

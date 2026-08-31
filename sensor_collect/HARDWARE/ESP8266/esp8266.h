@@ -52,8 +52,16 @@ u8 ESP8266_GetIP(u8 *ipbuf);                            /* local IP, buf >= 16 b
 
 /* TCP client (MQTT / OneNet) */
 u8  ESP8266_ConnectTCP(u8 *ip, u16 port);               /* CIPSTART TCP, link 0 */
+u8  ESP8266_ConnectSSL(u8 *host, u16 port);             /* CIPSTART SSL, link 0 */
 u16 ESP8266_GetTcpData(u8 *buf, u16 maxlen);            /* read one "+IPD" payload */
 u8  ESP8266_SendTcpData(u8 link_id, u8 *data, u16 len); /* raw send on a link */
 u8  ESP8266_CloseLink(u8 link_id);                      /* close a link */
+
+/* MQTT client (ESP-AT firmware: AT+MQTT...) */
+u8 ESP8266_MQTTUserCfg(u8 link_id, char *client_id, char *user, char *pass);
+u8 ESP8266_MQTTConn(u8 link_id, char *host, u16 port, u8 reconnect);
+u8 ESP8266_MQTTPub(u8 link_id, char *topic, char *data, u8 qos, u8 retain);
+u8 ESP8266_MQTTPubRaw(u8 link_id, char *topic, u8 *data, u16 len, u8 qos, u8 retain);
+u8 ESP8266_MQTTClean(u8 link_id);
 
 #endif

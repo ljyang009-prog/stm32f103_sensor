@@ -24,7 +24,7 @@
 | 气体 | MQ-2（模拟量 + 数字量）|
 | 光照 | 光敏电阻 + 补光 LED |
 | 显示 | 2.4/2.8 寸 TFT LCD（ILI9341 等）|
-| 通信 | ESP8266（WiFi，烧录 Arduino 固件）|
+| 通信 | ESP-01S（ESP-AT 固件，需支持 SSL socket）|
 | 云平台 | OneNET Studio（物模型 / MQTT）|
 
 ---
@@ -34,7 +34,7 @@
 ### GPIOA
 | 引脚 | 功能 | 说明 |
 |------|------|------|
-| PA0 | ESP8266 RST | 可选复位脚（Arduino 固件下未使用）|
+| PA0 | ESP8266 RST | 可选复位脚，低电平有效 |
 | PA1 | MQ-2 模拟输出 | ADC1 通道 1 |
 | PA2 | USART2_TX | → ESP8266 RX（发数据给 ESP8266）|
 | PA3 | USART2_RX | ← ESP8266 TX |
@@ -59,18 +59,18 @@
 
 ## 软件架构
 
-采用「双芯片分工」架构：
+当前 STM32 工程使用 ESP-AT 架构：
 
 ```
 ┌──────────┐  USART2(PA2)   ┌─────────────────────┐  WiFi(TLS)  ┌────────────┐
 │  STM32   │ ──────────────► │  ESP8266            │ ───────────► │  OneNET    │
-│ 读传感器  │  每5秒发一行数据  │  (Arduino 固件)      │   MQTT 上报   │  Studio    │
-│ LCD显示  │ "温度,湿度,气体,光照"│  连WiFi + MQTT(TLS) │              │  物模型     │
+│ 读传感器  │  AT指令 + MQTT报文 │  (ESP-AT 固件)       │   MQTT/TLS  │  Studio    │
+│ LCD显示  │  USART2(PA2/PA3)  │  WiFi + SSL socket   │              │  物模型     │
 └──────────┘                 └─────────────────────┘             └────────────┘
 ```
 
-- **STM32**（Keil 工程）：负责采集传感器、LCD 显示、报警，每 5 秒通过 USART2 发送一行数据 `温度,湿度,气体浓度,光照`（如 `24,53,5.4,81`）给 ESP8266。
-- **ESP8266**（Arduino 固件）：自己连接 WiFi、通过 MQTT over TLS 连接 OneNET，收到 STM32 的数据后打包成物模型 JSON 上报。
+- **STM32**（Keil 工程）：负责传感器采集，并通过 USART2 驱动 ESP-01S，生成 MQTT CONNECT/PUBLISH 报文。
+- **ESP-01S**（ESP-AT 固件）：连接 WiFi，通过 `AT+CIPSTART="SSL"` 建立 OneNET TLS socket。
 
 ---
 
@@ -109,51 +109,58 @@ sensor_collect/
 2. 编译（ARM Compiler V5，器件 `STM32F103RC`）。
 3. 用 ST-Link 等烧录生成的目标文件。
 
-### 2. ESP8266（Arduino IDE）
+### 2. ESP-01S（AT 固件）
 
-1. 安装 Arduino IDE，添加 ESP8266 开发板支持：
-   - 附加开发板管理器网址：`http://arduino.esp8266.com/stable/package_esp8266com_index.json`
-   - 开发板管理器安装 `esp8266`
-2. 库管理器安装 `PubSubClient`。
-3. 打开 `ESP8266_Arduino/esp8266_onenet/esp8266_onenet.ino`。
-4. 用 USB 转串口模块烧录（烧录时 GPIO0 接地进入烧录模式）。
-5. 烧录完成后把 ESP8266 接回 STM32 的 USART2（PA2/PA3）。
+1. 使用串口助手确认 `AT` 返回 `OK`。
+2. 执行 `AT+CIPSTART=0,"SSL","D155yb7UYS.mqttstls.acc.cmcconenet.cn",8883`，必须返回 `CONNECT`/`OK`。
+3. 若返回 `ERROR` 或不识别 `SSL`，需换用包含 SSL socket 支持的 ESP8266 AT 固件。
+4. 把 ESP-01S 接回 STM32 USART2（PA2/PA3），注意 3.3V 供电峰值电流应至少 500mA。
 
 ---
 
 ## 配置说明
 
-### ESP8266 固件配置（`ESP8266_Arduino/.../esp8266_onenet.ino`）
+### 当前 AT 方案配置
 
-```cpp
-const char* WIFI_SSID   = "你的WiFi名称";
-const char* WIFI_PASS   = "你的WiFi密码";
+WiFi 名称和密码在 `HARDWARE/ESP8266/esp8266.h` 中修改：
 
-const char* ONENET_PROID   = "产品ID";
-const char* ONENET_DEVNAME = "设备名称";
-const char* ONENET_TOKEN   = "生成的token";
+```c
+#define ESP8266_WIFI_SSID      "你的WiFi名称"
+#define ESP8266_WIFI_PASSWORD  "你的WiFi密码"
+```
+
+OneNET 产品、设备、token 和 TLS 域名在 `HARDWARE/ONENET/onenet.h` 中修改：
+
+```c
+#define ONENET_PROID        "产品ID"
+#define ONENET_DEVID        "设备名称"
+#define ONENET_TOKEN        "生成的token"
+#define ONENET_SERVER_HOST  "产品专属.mqttstls.acc.cmcconenet.cn"
 ```
 
 ### OneNET 平台配置
 
 1. 登录 [OneNET Studio](https://open.iot.10086.cn) → 创建产品（MQTT 协议）。
 2. 添加设备，得到 **产品ID**、**设备名称**、**设备密钥/access_key**（或生成 token）。
-3. 配置物模型，添加 4 个属性：
+3. 配置物模型，添加 5 个属性：
 
-| 功能名称 | 标识符 | 数据类型 | 单位 |
-|---------|--------|---------|------|
-| 温度 | `temperature` | double | ℃ |
-| 湿度 | `humidity` | double | % |
-| 有害气体浓度 | `gas` | double | ppm |
-| 光照亮度 | `light` | int32 | % |
+| 功能名称 | 标识符 | 数据类型 | 权限/单位 |
+|---------|--------|---------|-----------|
+| 温度 | `temperature` | double | 只读 / ℃ |
+| 湿度 | `humidity` | double | 只读 / % |
+| 有害气体浓度 | `gas` | double | 只读 / ppm |
+| 光照亮度 | `light` | int32 | 只读 / % |
+| LED 模式 | `led_mode` | int32/枚举 | 可读写；0 关闭、1 常亮、2 闪烁 |
 
 4. 上报 topic：`$sys/{产品ID}/{设备名称}/thing/property/post`
+5. LED 属性设置 topic：`$sys/{产品ID}/{设备名称}/thing/property/set`
+6. LED 属性设置回复 topic：`$sys/{产品ID}/{设备名称}/thing/property/set_reply`
 
 ---
 
 ## 数据流（OneNET）
 
-设备每 5 秒上报一次，4 个数据流：
+设备每 5 秒上报一次，包含传感器数据和当前 LED 模式：
 
 | 数据流 | 含义 |
 |--------|------|
@@ -161,10 +168,13 @@ const char* ONENET_TOKEN   = "生成的token";
 | `humidity` | 湿度 (%) |
 | `gas` | 有害气体浓度 (ppm，由 MQ-2 电压换算) |
 | `light` | 光照亮度 (%) |
+| `led_mode` | LED0 模式：0 关闭、1 常亮、2 每 500 ms 闪烁 |
 
 ---
 
 ## 说明
 
 - MQ-2 的 ppm 浓度是基于 `Rs/R0` 曲线拟合的**近似值**（未用标准气体标定），仅作趋势参考；上电时会在洁净空气中自动标定 R0。
-- 新版 OneNET Studio 的 MQTT 为 **TLS 加密**，普通 ESP8266 AT 固件不支持，因此本项目将 ESP8266 刷成 **Arduino 固件**自行完成 MQTT(TLS) 上报。
+- OneNET Studio 使用产品专属 TLS 域名和 `8883` 端口，不能把 `mqtts` 域名当作普通 TCP `1883` 使用。
+- OneNET token 通常超过 ESP-AT `AT+MQTTUSERCFG` 的 password 长度限制，所以本工程使用 SSL socket + STM32 MQTT 组包。
+- `ESP8266_Arduino/` 仍保留为可选的 Arduino 固件方案，不要与当前 STM32 AT 方案同时使用。

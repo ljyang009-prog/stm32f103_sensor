@@ -196,21 +196,29 @@ u8 ESP8266_SendCmd(u8 *cmd, u8 *ack, u16 timeout_ms)
  *----------------------------------------------------------------------------*/
 u8 ESP8266_Init(void)
 {
+    u8 i;
+
     ESP8266_Uart_Init(ESP8266_UART_BAUD);
 
 #if ESP8266_USE_HW_RESET
     HAL_GPIO_WritePin(ESP8266_RST_PORT, ESP8266_RST_PIN, GPIO_PIN_RESET);
     delay_ms(250);
     HAL_GPIO_WritePin(ESP8266_RST_PORT, ESP8266_RST_PIN, GPIO_PIN_SET);
-    delay_ms(500);
+    delay_ms(2000);                 /* ESP-AT needs ~1-2s to boot */
 #else
-    delay_ms(200);
+    delay_ms(2000);
 #endif
 
     ESP8266_ClearRx();
 
-    /* Module present? */
-    if (ESP8266_SendCmd((u8 *)"AT", (u8 *)"OK", 2000) != ESP8266_OK)
+    /* Module present? retry a few times (ESP-AT boot is slow). */
+    for (i = 0; i < 5; i++)
+    {
+        if (ESP8266_SendCmd((u8 *)"AT", (u8 *)"OK", 2000) == ESP8266_OK)
+            break;
+        delay_ms(500);
+    }
+    if (i == 5)
         return ESP8266_ERR;
 
     /* Disable echo so responses are clean. */
@@ -293,26 +301,47 @@ u8 ESP8266_ConnectTCP(u8 *ip, u16 port)
     return ESP8266_OK;
 }
 
+u8 ESP8266_ConnectSSL(u8 *host, u16 port)
+{
+    char cmd[112];
+
+    /* OneNET's token is too long for AT+MQTTUSERCFG on ESP8266 ESP-AT.
+     * Use the AT SSL socket and let the STM32 build the MQTT packets. */
+    if (ESP8266_SendCmd((u8 *)"AT+CIPMODE=0", (u8 *)"OK", 2000) != ESP8266_OK)
+        return ESP8266_ERR;
+
+    if (ESP8266_SendCmd((u8 *)"AT+CIPMUX=1", (u8 *)"OK", 2000) != ESP8266_OK)
+        return ESP8266_ERR;
+
+    /* Keep +IPD in the parser's expected +IPD,<link>,<len>: format.
+     * Older AT firmware may not implement this command; its default is 0. */
+    ESP8266_SendCmd((u8 *)"AT+CIPDINFO=0", (u8 *)"OK", 2000);
+
+    sprintf(cmd, "AT+CIPSTART=0,\"SSL\",\"%s\",%d", (char *)host, port);
+    if (ESP8266_SendCmd((u8 *)cmd, (u8 *)"OK", 20000) != ESP8266_OK)
+        return ESP8266_ERR;
+
+    return ESP8266_OK;
+}
+
 u16 ESP8266_GetTcpData(u8 *buf, u16 maxlen)
 {
     u16 total = ESP8266_GetRxLen();
     u16 i, j, n;
     u16 dlen = 0;
+    u16 start;
 
-    if (total < 10)
+    if (total < 8)
         return 0;
 
-    /* Search for "+IPD,<link>,<len>:" */
-    for (i = 0; i <= (u16)(total - 5); i++)
+    /* Search for "+IPD,<link>,<len>:" anywhere in the buffer. */
+    for (i = 0; (u16)(i + 5) <= total; i++)
     {
         if (ESP8266_Peek(i) == '+' && ESP8266_Peek(i + 1) == 'I' &&
             ESP8266_Peek(i + 2) == 'P' && ESP8266_Peek(i + 3) == 'D' &&
             ESP8266_Peek(i + 4) == ',')
         {
-            if (i + 7 >= total)
-                break;
-
-            /* link id at i+5, ',' at i+6, length digits from i+7. */
+            /* length digits start at i+7 (i+5 = link id, i+6 = ','). */
             j = i + 7;
             dlen = 0;
             while (j < total)
@@ -323,20 +352,22 @@ u16 ESP8266_GetTcpData(u8 *buf, u16 maxlen)
                 dlen = (u16)(dlen * 10 + (c - '0'));
                 j++;
             }
+            if (j >= total || ESP8266_Peek(j) != ':')
+                return 0;                    /* header not fully received yet */
 
-            if (j < total && ESP8266_Peek(j) == ':')
-            {
-                j++;            /* points at the data */
-                n = 0;
-                while (j < total && n < dlen && n < maxlen)
-                {
-                    buf[n++] = ESP8266_Peek(j);
-                    j++;
-                }
-                ESP8266_ClearRx();   /* consume this notification */
-                return n;
-            }
-            break;
+            j++;                             /* points at the payload */
+            start = j;
+
+            if ((u16)(total - start) < dlen)
+                return 0;                    /* payload not all arrived yet */
+
+            n = (dlen < maxlen) ? dlen : maxlen;
+            for (j = 0; j < n; j++)
+                buf[j] = ESP8266_Peek(start + j);
+
+            /* Consume leading garbage + header + this payload only. */
+            esp8266_dev.rx_tail = (u16)((esp8266_dev.rx_tail + start + dlen) & RX_MASK);
+            return n;
         }
     }
     return 0;
@@ -345,6 +376,7 @@ u16 ESP8266_GetTcpData(u8 *buf, u16 maxlen)
 u8 ESP8266_SendTcpData(u8 link_id, u8 *data, u16 len)
 {
     char cmd[32];
+    u8 r = ESP8266_OK;
 
     sprintf(cmd, "AT+CIPSEND=%d,%d", link_id, len);
     ESP8266_ClearRx();
@@ -355,17 +387,90 @@ u8 ESP8266_SendTcpData(u8 link_id, u8 *data, u16 len)
     if (ESP8266_WaitAck((u8 *)">", 2000) != ESP8266_OK)
         return ESP8266_ERR;
 
+    ESP8266_ClearRx();              /* drop the "OK\r\n>" residue */
     ESP8266_Uart_Send(data, len);
 
+    /* Some firmware says "SEND OK", older ones just "OK". Accept both. */
     if (ESP8266_WaitAck((u8 *)"SEND OK", 3000) != ESP8266_OK)
-        return ESP8266_ERR;
+        if (ESP8266_WaitAck((u8 *)"OK", 2000) != ESP8266_OK)
+            r = ESP8266_ERR;
 
-    return ESP8266_OK;
+    return r;
 }
 
 u8 ESP8266_CloseLink(u8 link_id)
 {
     char cmd[32];
     sprintf(cmd, "AT+CIPCLOSE=%d", link_id);
+    return ESP8266_SendCmd((u8 *)cmd, (u8 *)"OK", 2000);
+}
+
+/*------------------------------------------------------------------------------
+ * MQTT client (ESP-AT firmware: AT+MQTT...)
+ *----------------------------------------------------------------------------*/
+u8 ESP8266_MQTTUserCfg(u8 link_id, char *client_id, char *user, char *pass)
+{
+    char cmd[360];
+
+    /* scheme=1 : MQTT over TCP. cert/CA/path are not used. */
+    sprintf(cmd, "AT+MQTTUSERCFG=%d,1,\"%s\",\"%s\",\"%s\",0,0,\"\"",
+            link_id, client_id, user, pass);
+    return ESP8266_SendCmd((u8 *)cmd, (u8 *)"OK", 3000);
+}
+
+u8 ESP8266_MQTTConn(u8 link_id, char *host, u16 port, u8 reconnect)
+{
+    char cmd[160];
+
+    sprintf(cmd, "AT+MQTTCONN=%d,\"%s\",%d,%d", link_id, host, port, reconnect);
+    if (ESP8266_SendCmd((u8 *)cmd, (u8 *)"OK", 5000) != ESP8266_OK)
+        return ESP8266_ERR;
+
+    /* Result arrives asynchronously as "+MQTTCONNECTED:<link>,...".
+     * (The buffer still holds the response, so search it directly.) */
+    return ESP8266_WaitAck((u8 *)"MQTTCONNECTED", 8000);
+}
+
+u8 ESP8266_MQTTPub(u8 link_id, char *topic, char *data, u8 qos, u8 retain)
+{
+    char cmd[640];
+    int i, j;
+
+    /* Escape '"' and '\' so JSON payloads survive the AT quoted-string parser. */
+    j = sprintf(cmd, "AT+MQTTPUB=%d,\"%s\",\"", link_id, topic);
+    for (i = 0; data[i] != '\0' && j < (int)sizeof(cmd) - 4; i++)
+    {
+        if (data[i] == '"' || data[i] == '\\')
+            cmd[j++] = '\\';
+        cmd[j++] = data[i];
+    }
+    j += sprintf(cmd + j, "\",%d,%d", qos, retain);
+
+    return ESP8266_SendCmd((u8 *)cmd, (u8 *)"OK", 5000);
+}
+
+u8 ESP8266_MQTTPubRaw(u8 link_id, char *topic, u8 *data, u16 len, u8 qos, u8 retain)
+{
+    char cmd[128];
+
+    sprintf(cmd, "AT+MQTTPUBRAW=%d,\"%s\",%d,%d,%d", link_id, topic, len, qos, retain);
+    ESP8266_ClearRx();
+    ESP8266_Uart_Send((u8 *)cmd, (u16)strlen(cmd));
+    ESP8266_Uart_Send((u8 *)"\r\n", 2);
+
+    /* Firmware replies "OK\r\n>" then accepts <len> raw bytes (no escaping). */
+    if (ESP8266_WaitAck((u8 *)">", 3000) != ESP8266_OK)
+        return ESP8266_ERR;
+
+    ESP8266_ClearRx();              /* drop the "OK\r\n>" residue */
+    ESP8266_Uart_Send(data, len);
+
+    return ESP8266_WaitAck((u8 *)"OK", 5000);
+}
+
+u8 ESP8266_MQTTClean(u8 link_id)
+{
+    char cmd[32];
+    sprintf(cmd, "AT+MQTTCLEAN=%d", link_id);
     return ESP8266_SendCmd((u8 *)cmd, (u8 *)"OK", 2000);
 }
