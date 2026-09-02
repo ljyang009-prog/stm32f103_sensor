@@ -179,6 +179,63 @@ static u8 ESP8266_WaitAck(u8 *ack, u16 timeout_ms)
     return ESP8266_ERR;
 }
 
+static u8 ESP8266_WaitAny(u8 *ack1, u8 *ack2, u16 timeout_ms)
+{
+    u32 t0 = HAL_GetTick();
+
+    while ((HAL_GetTick() - t0) <= timeout_ms)
+    {
+        if (ESP8266_FindStr(ack1, (u16)strlen((char *)ack1)) ||
+            ESP8266_FindStr(ack2, (u16)strlen((char *)ack2)))
+        {
+            return ESP8266_OK;
+        }
+        if (ESP8266_FindStr((u8 *)"ERROR", 5) ||
+            ESP8266_FindStr((u8 *)"FAIL", 4))
+        {
+            return ESP8266_ERR;
+        }
+        delay_ms(1);
+    }
+    return ESP8266_ERR;
+}
+
+static u8 ESP8266_SendCmdAny(u8 *cmd, u8 *ack1, u8 *ack2,
+                             u16 timeout_ms)
+{
+    ESP8266_ClearRx();
+    ESP8266_Uart_Send(cmd, (u16)strlen((char *)cmd));
+    ESP8266_Uart_Send((u8 *)"\r\n", 2);
+    return ESP8266_WaitAny(ack1, ack2, timeout_ms);
+}
+
+static void ESP8266_PrintRx(const char *label)
+{
+    u8 raw[96];
+    u16 n;
+    u16 i;
+
+    n = ESP8266_ReadRx(raw, sizeof(raw));
+    printf("%s", label);
+    if (n == 0)
+    {
+        printf("<no response>\r\n");
+        return;
+    }
+
+    for (i = 0; i < n; i++)
+    {
+        u8 c = raw[i];
+        if (c >= 0x20 && c <= 0x7E)
+            printf("%c", c);
+        else if (c == '\r' || c == '\n')
+            printf(" ");
+        else
+            printf(".");
+    }
+    printf("\r\n");
+}
+
 u8 ESP8266_SendCmd(u8 *cmd, u8 *ack, u16 timeout_ms)
 {
     ESP8266_ClearRx();
@@ -307,19 +364,40 @@ u8 ESP8266_ConnectSSL(u8 *host, u16 port)
 
     /* OneNET's token is too long for AT+MQTTUSERCFG on ESP8266 ESP-AT.
      * Use the AT SSL socket and let the STM32 build the MQTT packets. */
-    if (ESP8266_SendCmd((u8 *)"AT+CIPMODE=0", (u8 *)"OK", 2000) != ESP8266_OK)
+    /* ESP-AT may preserve CIPMUX across resets. CIPMODE can only be changed
+     * while multiplexing is disabled, so normalize the state first. */
+    if (ESP8266_SendCmd((u8 *)"AT+CIPMUX=0", (u8 *)"OK", 2000) != ESP8266_OK)
+    {
+        ESP8266_PrintRx("ESP CIPMUX=0 response: ");
         return ESP8266_ERR;
+    }
+
+    /* Some older AT firmware does not implement CIPMODE. Non-transparent
+     * mode is already the reset default, so this command is optional. */
+    if (ESP8266_SendCmd((u8 *)"AT+CIPMODE=0", (u8 *)"OK", 1000) != ESP8266_OK)
+    {
+        ESP8266_PrintRx("ESP CIPMODE response: ");
+    }
 
     if (ESP8266_SendCmd((u8 *)"AT+CIPMUX=1", (u8 *)"OK", 2000) != ESP8266_OK)
+    {
+        ESP8266_PrintRx("ESP CIPMUX response: ");
         return ESP8266_ERR;
+    }
 
     /* Keep +IPD in the parser's expected +IPD,<link>,<len>: format.
      * Older AT firmware may not implement this command; its default is 0. */
     ESP8266_SendCmd((u8 *)"AT+CIPDINFO=0", (u8 *)"OK", 2000);
 
     sprintf(cmd, "AT+CIPSTART=0,\"SSL\",\"%s\",%d", (char *)host, port);
-    if (ESP8266_SendCmd((u8 *)cmd, (u8 *)"OK", 20000) != ESP8266_OK)
+    if (ESP8266_SendCmdAny((u8 *)cmd, (u8 *)"OK", (u8 *)"CONNECT",
+                           20000) != ESP8266_OK)
+    {
+        ESP8266_PrintRx("ESP SSL response: ");
+        ESP8266_SendCmd((u8 *)"AT+GMR", (u8 *)"OK", 2000);
+        ESP8266_PrintRx("ESP firmware: ");
         return ESP8266_ERR;
+    }
 
     return ESP8266_OK;
 }
@@ -385,15 +463,21 @@ u8 ESP8266_SendTcpData(u8 link_id, u8 *data, u16 len)
 
     /* Wait for the ">" prompt, then send the raw payload. */
     if (ESP8266_WaitAck((u8 *)">", 2000) != ESP8266_OK)
+    {
+        ESP8266_PrintRx("ESP CIPSEND prompt response: ");
         return ESP8266_ERR;
+    }
 
     ESP8266_ClearRx();              /* drop the "OK\r\n>" residue */
     ESP8266_Uart_Send(data, len);
 
-    /* Some firmware says "SEND OK", older ones just "OK". Accept both. */
-    if (ESP8266_WaitAck((u8 *)"SEND OK", 3000) != ESP8266_OK)
-        if (ESP8266_WaitAck((u8 *)"OK", 2000) != ESP8266_OK)
-            r = ESP8266_ERR;
+    /* Some firmware says "SEND OK", older ones just "OK". Accept both and
+     * stop immediately on SEND FAIL/ERROR so reconnect starts promptly. */
+    if (ESP8266_WaitAny((u8 *)"SEND OK", (u8 *)"\r\nOK\r\n", 5000) != ESP8266_OK)
+    {
+        ESP8266_PrintRx("ESP payload send response: ");
+        r = ESP8266_ERR;
+    }
 
     return r;
 }

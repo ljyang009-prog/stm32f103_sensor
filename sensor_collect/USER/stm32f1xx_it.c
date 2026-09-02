@@ -22,6 +22,10 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "stm32f1xx_it.h"
+#include "FreeRTOS.h"
+#include "task.h"
+
+extern void xPortSysTickHandler(void);
    
 /** @addtogroup STM32F1xx_HAL_Examples
   * @{
@@ -109,9 +113,7 @@ void UsageFault_Handler(void)
   * @param  None
   * @retval None
   */
-void SVC_Handler(void)
-{
-}
+/* SVC_Handler is provided by the FreeRTOS Cortex-M3 port. */
 
 /**
   * @brief  This function handles Debug Monitor exception.
@@ -127,9 +129,7 @@ void DebugMon_Handler(void)
   * @param  None
   * @retval None
   */
-void PendSV_Handler(void)
-{
-}
+/* PendSV_Handler is provided by the FreeRTOS Cortex-M3 port. */
 
 /**
   * @brief  This function handles SysTick Handler.
@@ -139,6 +139,10 @@ void PendSV_Handler(void)
 void SysTick_Handler(void)
 {
   HAL_IncTick();
+  if (xTaskGetSchedulerState() != taskSCHEDULER_NOT_STARTED)
+  {
+    xPortSysTickHandler();
+  }
 }
 
 /******************************************************************************/

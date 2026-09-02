@@ -23,6 +23,12 @@ static volatile u8 onenet_led_mode = ONENET_LED_OFF;
     "$sys/" ONENET_PROID "/" ONENET_DEVID "/thing/property/set"
 #define ONENET_PROPERTY_SET_REPLY_TOPIC \
     "$sys/" ONENET_PROID "/" ONENET_DEVID "/thing/property/set_reply"
+#define ONENET_PROPERTY_POST_REPLY_TOPIC \
+    "$sys/" ONENET_PROID "/" ONENET_DEVID "/thing/property/post/reply"
+#define ONENET_EVENT_POST_TOPIC \
+    "$sys/" ONENET_PROID "/" ONENET_DEVID "/thing/event/post"
+#define ONENET_EVENT_POST_REPLY_TOPIC \
+    "$sys/" ONENET_PROID "/" ONENET_DEVID "/thing/event/post/reply"
 
 static void OneNet_ResetPacket(MQTT_PACKET_STRUCTURE *mqttPacket)
 {
@@ -36,12 +42,19 @@ static u8 OneNet_Publish(const char *topic, const char *payload)
 {
     MQTT_PACKET_STRUCTURE mqttPacket;
     u8 result;
+    u8 packet_result;
+    u32 packet_size;
 
     OneNet_ResetPacket(&mqttPacket);
-    if (MQTT_PacketPublish(MQTT_PUBLISH_ID, (int8 *)topic, (int8 *)payload,
-                           (uint32)strlen(payload), MQTT_QOS_LEVEL0, 0, 0,
-                           &mqttPacket) != 0)
+    packet_size = (u32)strlen(topic) + (u32)strlen(payload) + 5u;
+    packet_result = MQTT_PacketPublish(MQTT_PUBLISH_ID, (int8 *)topic,
+                                       (int8 *)payload,
+                                       (uint32)strlen(payload),
+                                       MQTT_QOS_LEVEL0, 0, 0, &mqttPacket);
+    if (packet_result != 0)
     {
+        printf("MQTT publish build failed, code=%u need=%u free=%u\r\n",
+               packet_result, packet_size, (u32)xPortGetFreeHeapSize());
         return ESP8266_ERR;
     }
 
@@ -54,15 +67,18 @@ static u8 OneNet_Publish(const char *topic, const char *payload)
 static u8 OneNet_SubscribePropertySet(void)
 {
     MQTT_PACKET_STRUCTURE mqttPacket;
-    const int8 *topics[1];
+    const int8 *topics[3];
     u8 suback[16];
     u16 n;
     u32 t0;
+    u8 i;
 
     OneNet_ResetPacket(&mqttPacket);
     topics[0] = (const int8 *)ONENET_PROPERTY_SET_TOPIC;
+    topics[1] = (const int8 *)ONENET_PROPERTY_POST_REPLY_TOPIC;
+    topics[2] = (const int8 *)ONENET_EVENT_POST_REPLY_TOPIC;
     if (MQTT_PacketSubscribe(MQTT_SUBSCRIBE_ID, MQTT_QOS_LEVEL0,
-                             topics, 1, &mqttPacket) != 0)
+                             topics, 3, &mqttPacket) != 0)
     {
         printf("OneNet property subscription build failed\r\n");
         return ESP8266_ERR;
@@ -81,22 +97,25 @@ static u8 OneNet_SubscribePropertySet(void)
     while ((HAL_GetTick() - t0) <= 5000)
     {
         n = ESP8266_GetTcpData(suback, sizeof(suback));
-        if (n >= 5 && suback[0] == 0x90 &&
+        if (n >= 7 && suback[0] == 0x90 && suback[1] == 0x05 &&
             suback[2] == MOSQ_MSB(MQTT_SUBSCRIBE_ID) &&
             suback[3] == MOSQ_LSB(MQTT_SUBSCRIBE_ID))
         {
-            if (suback[4] != 0x80)
+            for (i = 0; i < 3; i++)
             {
-                printf("OneNet LED control subscribed\r\n");
-                return ESP8266_OK;
+                if (suback[4 + i] == 0x80)
+                {
+                    printf("OneNet subscription %u refused\r\n", i);
+                    return ESP8266_ERR;
+                }
             }
-            printf("OneNet LED subscription refused\r\n");
-            return ESP8266_ERR;
+            printf("OneNet control and reply topics subscribed\r\n");
+            return ESP8266_OK;
         }
         delay_ms(10);
     }
 
-    printf("OneNet LED subscription timeout\r\n");
+    printf("OneNet topic subscription timeout\r\n");
     return ESP8266_ERR;
 }
 
@@ -131,8 +150,8 @@ u8 OneNet_Init(void)
 
     OneNet_ResetPacket(&mqttPacket);
 
-    /* Ensure reconnects do not fail with "ALREADY CONNECTED". */
-    ESP8266_CloseLink(ONENET_MQTT_LINK);
+    /* CloudConnect resets the ESP8266 before each connection attempt, so no
+     * stale socket can remain here. Avoid a two-second close timeout. */
 
     printf("OneNet TLS connect %s:%u...\r\n",
            ONENET_SERVER_HOST, ONENET_SERVER_PORT);
@@ -189,11 +208,30 @@ u8 OneNet_Init(void)
     return ESP8266_ERR;
 }
 
-/* 物模型属性上报：把 4 个传感器值打包成 OneJSON 发到 property/post topic。 */
-u8 OneNet_SendData(float temperature, float humidity, float gas, float light)
+static u8 OneNet_TemperatureAlarm(u8 alarm_mask)
+{
+    if (alarm_mask & ONENET_ALARM_TEMP_HIGH)
+        return 2;
+    if (alarm_mask & ONENET_ALARM_TEMP_LOW)
+        return 1;
+    return 0;
+}
+
+static u8 OneNet_HumidityAlarm(u8 alarm_mask)
+{
+    if (alarm_mask & ONENET_ALARM_HUMIDITY_HIGH)
+        return 2;
+    if (alarm_mask & ONENET_ALARM_HUMIDITY_LOW)
+        return 1;
+    return 0;
+}
+
+/* Keep the periodic report limited to identifiers present in the thing model. */
+u8 OneNet_SendData(float temperature, float humidity, float gas, float light,
+                   u8 alarm_mask)
 {
     char topic[96];
-    char payload[256];
+    static char payload[256];
 
     onenet_msg_id++;
 
@@ -213,6 +251,44 @@ u8 OneNet_SendData(float temperature, float humidity, float gas, float light)
         return ESP8266_ERR;
     }
 
+    printf("OneNet property packet sent, id=%u alarm=0x%02X heap=%u\r\n",
+           onenet_msg_id, alarm_mask, (u32)xPortGetFreeHeapSize());
+    return ESP8266_OK;
+}
+
+/* Send one edge-triggered event containing every source that just triggered. */
+u8 OneNet_SendAlarmEvent(u8 trigger_mask, float temperature,
+                         float humidity, float gas)
+{
+    static char payload[384];
+
+    if (trigger_mask == 0)
+        return ESP8266_OK;
+
+    onenet_msg_id++;
+    sprintf(payload,
+        "{\"id\":\"%u\",\"version\":\"1.0\",\"params\":{"
+        "\"alarm_event\":{\"value\":{"
+        "\"trigger_mask\":%u,"
+        "\"gas_alarm\":%u,"
+        "\"temperature_alarm\":%u,"
+        "\"humidity_alarm\":%u,"
+        "\"temperature\":%.1f,"
+        "\"humidity\":%.1f,"
+        "\"gas\":%.1f}}}}",
+        onenet_msg_id, trigger_mask,
+        (trigger_mask & ONENET_ALARM_GAS) ? 1 : 0,
+        OneNet_TemperatureAlarm(trigger_mask),
+        OneNet_HumidityAlarm(trigger_mask),
+        temperature, humidity, gas);
+
+    if (OneNet_Publish(ONENET_EVENT_POST_TOPIC, payload) != ESP8266_OK)
+    {
+        printf("OneNet alarm event failed, mask=0x%02X\r\n", trigger_mask);
+        return ESP8266_ERR;
+    }
+
+    printf("OneNet alarm event sent, mask=0x%02X\r\n", trigger_mask);
     return ESP8266_OK;
 }
 
@@ -295,6 +371,24 @@ static void OneNet_ExtractId(const char *payload, char *id, u16 id_size)
     id[n] = '\0';
 }
 
+static u8 OneNet_ReplyAccepted(const char *payload)
+{
+    const char *p;
+
+    p = strstr(payload, "\"code\"");
+    if (p == NULL)
+        return 0;
+    p = strchr(p + 6, ':');
+    if (p == NULL)
+        return 0;
+    p++;
+    while (*p == ' ' || *p == '\t')
+        p++;
+    return (p[0] == '2' && p[1] == '0' && p[2] == '0' &&
+            (p[3] == ',' || p[3] == '}' || p[3] == ' ' ||
+             p[3] == '\t' || p[3] == '\r' || p[3] == '\n'));
+}
+
 static u8 OneNet_ParseLedMode(const char *payload, u8 *mode)
 {
     const char *p;
@@ -355,6 +449,19 @@ u8 OneNet_Process(void)
     if (!OneNet_DecodePublish(packet, packet_len, topic, sizeof(topic),
                               payload, sizeof(payload)))
         return ESP8266_OK;
+    if (strcmp(topic, ONENET_EVENT_POST_REPLY_TOPIC) == 0)
+    {
+        printf("OneNet alarm event reply: %s\r\n", payload);
+        return ESP8266_OK;
+    }
+    if (strcmp(topic, ONENET_PROPERTY_POST_REPLY_TOPIC) == 0)
+    {
+        if (OneNet_ReplyAccepted(payload))
+            printf("OneNet cloud confirmed property: %s\r\n", payload);
+        else
+            printf("OneNet cloud rejected property: %s\r\n", payload);
+        return ESP8266_OK;
+    }
     if (strcmp(topic, ONENET_PROPERTY_SET_TOPIC) != 0)
         return ESP8266_OK;
 

@@ -25,6 +25,9 @@ ui_*
 # VS Code
 .vscode/
 
+# Local device credentials
+sensor_collect/USER/app_config.h
+
 # OS
 Thumbs.db
 Desktop.ini

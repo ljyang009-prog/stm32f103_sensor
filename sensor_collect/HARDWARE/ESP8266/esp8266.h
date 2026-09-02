@@ -2,14 +2,11 @@
 #define __ESP8266_H
 
 #include "sys.h"
+#include "app_config.h"
 
 /*==============================================================================
  *  User configuration
  *============================================================================*/
-
-/* WiFi access point to join (change these to your router). */
-#define ESP8266_WIFI_SSID       "OnePlus 11"
-#define ESP8266_WIFI_PASSWORD   "ljy050724"
 
 /* Baud rate for the ESP8266 (default AT firmware runs at 115200). */
 #define ESP8266_UART_BAUD       115200
